@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>IDS Real-Time Engine</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      body {
+        font-family: Arial, sans-serif;
+        margin: 0;
+        background: #101319;
+        color: #e4e8ef;
+      }
+      .wrap {
+        max-width: 1000px;
+        margin: 2rem auto;
+        padding: 1rem;
+      }
+      .card {
+        background: #191f2a;
+        border: 1px solid #303a4a;
+        border-radius: 10px;
+        margin-bottom: 1rem;
+        padding: 1rem;
+      }
+      button {
+        background: #5a72ff;
+        color: white;
+        border: 0;
+        border-radius: 8px;
+        padding: 0.6rem 1rem;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.6;
+        cursor: wait;
+      }
+      textarea {
+        width: 100%;
+        min-height: 200px;
+        font-family: Consolas, monospace;
+        border-radius: 8px;
+        border: 1px solid #374255;
+        background: #0f141d;
+        color: #f0f3f8;
+        padding: 0.8rem;
+      }
+      input,
+      select {
+        border-radius: 8px;
+        border: 1px solid #374255;
+        background: #0f141d;
+        color: #f0f3f8;
+        padding: 0.5rem;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+      th,
+      td {
+        border-bottom: 1px solid #2e3748;
+        text-align: left;
+        padding: 0.45rem;
+        font-size: 0.9rem;
+      }
+      .row {
+        display: flex;
+        gap: 0.5rem;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .status {
+        font-size: 0.95rem;
+        opacity: 0.9;
+      }
+      .pill {
+        display: inline-block;
+        border-radius: 999px;
+        padding: 0.25rem 0.7rem;
+        border: 1px solid #3a455b;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>Intrusion Detection Real-Time Engine</h1>
+
+      <div class="card">
+        <h3>Real-Time Engine</h3>
+        <div class="row">
+          <label>Mode</label>
+          <select id="mode">
+            <option value="live">Live NIC</option>
+            <option value="pcap">PCAP tail</option>
+          </select>
+          <input id="interface" placeholder="Interface (e.g. Ethernet)" />
+          <input id="pcapPath" placeholder="PCAP path (for pcap mode)" />
+          <button id="startRtBtn">Start</button>
+          <button id="stopRtBtn">Stop</button>
+          <button id="refreshBtn">Refresh Status</button>
+        </div>
+        <p id="rtStatus" class="status"></p>
+        <p id="rtMetrics" class="status"></p>
+      </div>
+
+      <div class="card">
+        <h3>Live Alerts</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Time</th>
+              <th>Severity</th>
+              <th>Score</th>
+              <th>Source</th>
+              <th>Flow</th>
+            </tr>
+          </thead>
+          <tbody id="alertsBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <script>
+      const API = "http://127.0.0.1:8000";
+      const modeEl = document.getElementById("mode");
+      const interfaceEl = document.getElementById("interface");
+      const pcapPathEl = document.getElementById("pcapPath");
+      const startRtBtn = document.getElementById("startRtBtn");
+      const stopRtBtn = document.getElementById("stopRtBtn");
+      const refreshBtn = document.getElementById("refreshBtn");
+      const rtStatus = document.getElementById("rtStatus");
+      const rtMetrics = document.getElementById("rtMetrics");
+      const alertsBody = document.getElementById("alertsBody");
+
+      let ws = null;
+      let knownIds = new Set();
+
+      function addAlertRow(event) {
+        if (knownIds.has(event.id)) return;
+        knownIds.add(event.id);
+        const tr = document.createElement("tr");
+        const dt = new Date(event.ts * 1000).toLocaleTimeString();
+        tr.innerHTML = `
+          <td>${event.id}</td>
+          <td>${dt}</td>
+          <td>${event.severity}</td>
+          <td>${(event.score * 100).toFixed(1)}%</td>
+          <td>${event.source}</td>
+          <td>${event.details.src_ip || "-"} -> ${event.details.dst_ip || "-"}</td>
+        `;
+        alertsBody.prepend(tr);
+        while (alertsBody.children.length > 100) alertsBody.removeChild(alertsBody.lastChild);
+      }
+
+      function showMetrics(metrics) {
+        rtMetrics.textContent = `pps=${metrics.packets_per_sec}, queue=${metrics.queue_depth}, alerts/min=${metrics.alerts_per_min}, packets=${metrics.packet_count}`;
+      }
+
+      async function refreshRealtimeStatus() {
+        const res = await fetch(`${API}/realtime/status`);
+        const data = await res.json();
+        rtStatus.textContent = data.running
+          ? `Running (${data.mode})`
+          : "Stopped";
+        if (data.metrics) showMetrics(data.metrics);
+      }
+
+      function connectAlertsWs() {
+        if (ws) ws.close();
+        ws = new WebSocket("ws://127.0.0.1:8000/ws/alerts");
+        ws.onmessage = (ev) => {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === "alert") {
+            addAlertRow(msg.event);
+            if (msg.metrics) showMetrics(msg.metrics);
+          } else if (msg.type === "heartbeat" && msg.metrics) {
+            showMetrics(msg.metrics);
+          }
+        };
+      }
+
+      startRtBtn.addEventListener("click", async () => {
+        startRtBtn.disabled = true;
+        rtStatus.textContent = "Starting realtime engine...";
+        try {
+          const payload = {
+            mode: modeEl.value,
+            interface: interfaceEl.value || null,
+            pcap_path: pcapPathEl.value || null,
+          };
+          const res = await fetch(`${API}/realtime/start`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || "Start failed");
+          rtStatus.textContent = "Realtime engine started.";
+          showMetrics(data.metrics);
+          connectAlertsWs();
+        } catch (err) {
+          rtStatus.textContent = err.message;
+        } finally {
+          startRtBtn.disabled = false;
+        }
+      });
+
+      stopRtBtn.addEventListener("click", async () => {
+        const res = await fetch(`${API}/realtime/stop`, { method: "POST" });
+        await res.json();
+        rtStatus.textContent = "Stop requested.";
+      });
+
+      refreshBtn.addEventListener("click", refreshRealtimeStatus);
+      refreshRealtimeStatus();
+    </script>
+  </body>
+</html>
